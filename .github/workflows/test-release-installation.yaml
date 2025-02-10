@@ -1,10 +1,11 @@
 name: 'test-release-installation'
 
 on:
-  workflow_run:
-    workflows: ['publish']
-    types:
-      - completed
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'The release tag to test'
+        required: true
 
 permissions:
   contents: read

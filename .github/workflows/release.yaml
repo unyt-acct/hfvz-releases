@@ -183,3 +183,21 @@ jobs:
           node ./scripts/merge-mac-yamls.mjs
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger installation tests
+        if: success()
+        uses: actions/github-script@v6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'test-release-installation.yaml',
+              ref: context.ref,
+              inputs: {
+                release_tag: `v${process.env.APP_VERSION}`
+              }
+            });
+        env:
+          APP_VERSION: ${{ steps.version.outputs.APP_VERSION }}
