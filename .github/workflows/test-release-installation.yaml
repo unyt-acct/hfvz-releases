@@ -1,0 +1,171 @@
+name: 'test-release-installation'
+
+on:
+  workflow_run:
+    workflows: ['publish']
+    types:
+      - completed
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: write
+
+jobs:
+  test-installation:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-2019, macos-13, macos-latest, ubuntu-22.04]
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v2
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
+
+      # Get app configuration
+      - name: Get app configuration
+        id: app_config
+        run: |
+          echo "APP_ID=$(node ./scripts/read-app-id.js)" >> $GITHUB_OUTPUT
+
+      - name: Get latest release
+        id: get_release
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const release = await github.rest.repos.getLatestRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            console.log('Found release:', release.data.tag_name);
+            return release.data;
+
+      - name: Download and test Windows installer
+        if: matrix.platform == 'windows-2019'
+        shell: pwsh
+        run: |
+          # Download the .exe installer
+          $exeAsset = ${{ steps.get_release.outputs.result }}.assets | Where-Object { $_.name -like '*-setup.exe' }
+          Write-Host "Downloading installer from: $($exeAsset.browser_download_url)"
+          Invoke-WebRequest -Uri $exeAsset.browser_download_url -OutFile "installer.exe"
+
+          # Install silently
+          Write-Host "Installing application..."
+          Start-Process -FilePath "installer.exe" -ArgumentList "/S" -Wait
+
+          # Verify installation - using APP_ID for correct path
+          $appId = "${{ steps.app_config.outputs.APP_ID }}"
+          $appPath = "${env:LOCALAPPDATA}\${appId}\${appId}.exe"
+          Write-Host "Checking for installation at: $appPath"
+          if (Test-Path $appPath) {
+            Write-Host "✅ Installation successful"
+            exit 0
+          } else {
+            Write-Error "❌ Installation failed - app not found at $appPath"
+            exit 1
+          }
+
+      - name: Download and test Linux DEB package
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          APP_ID="${{ steps.app_config.outputs.APP_ID }}"
+          echo "Testing installation for app: $APP_ID"
+
+          # Download the .deb package
+          DEB_URL=$(echo '${{ steps.get_release.outputs.result }}' | jq -r '.assets[] | select(.name | endswith(".deb")).browser_download_url')
+          echo "Downloading from: $DEB_URL"
+          wget "$DEB_URL" -O package.deb
+
+          # Install
+          echo "Installing package..."
+          sudo dpkg -i package.deb || {
+            echo "❌ Installation failed during dpkg"
+            exit 1
+          }
+
+          # Verify installation
+          BINARY_PATH="/usr/bin/${APP_ID}"
+          echo "Checking for binary at: $BINARY_PATH"
+          if [ -f "$BINARY_PATH" ]; then
+            echo "✅ Installation successful"
+            exit 0
+          else
+            echo "❌ Installation failed - binary not found"
+            exit 1
+          fi
+
+      - name: Download and test macOS DMG
+        if: matrix.platform == 'macos-13' || matrix.platform == 'macos-latest'
+        run: |
+          APP_ID="${{ steps.app_config.outputs.APP_ID }}"
+          echo "Testing installation for app: $APP_ID"
+
+          # Determine architecture
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "arm64" ]; then
+            DMG_PATTERN="*-arm64.dmg"
+          else
+            DMG_PATTERN="*-x64.dmg"
+          fi
+
+          # Download the appropriate DMG
+          echo "Looking for DMG matching pattern: $DMG_PATTERN"
+          DMG_URL=$(echo '${{ steps.get_release.outputs.result }}' | jq -r --arg PATTERN "$DMG_PATTERN" '.assets[] | select(.name | test($PATTERN)).browser_download_url')
+          echo "Downloading from: $DMG_URL"
+          curl -L -o package.dmg "$DMG_URL"
+
+          # Mount DMG
+          echo "Mounting DMG..."
+          VOLUME=$(hdiutil attach package.dmg | grep /Volumes/ | cut -f 3)
+          echo "Mounted at: $VOLUME"
+
+          # Copy app to Applications
+          echo "Installing to Applications..."
+          sudo cp -r "$VOLUME"/*.app /Applications/
+
+          # Unmount
+          echo "Unmounting DMG..."
+          hdiutil detach "$VOLUME"
+
+          # Verify installation
+          APP_PATH="/Applications/${APP_ID}.app"
+          echo "Checking for app at: $APP_PATH"
+          if [ -d "$APP_PATH" ]; then
+            echo "✅ Installation successful"
+            exit 0
+          else
+            echo "❌ Installation failed - app not found"
+            exit 1
+          fi
+
+      - name: Report test results
+        if: always()
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const conclusion = process.env.GITHUB_JOB_STATUS
+            const platform = process.env.MATRIX_PLATFORM
+            const version = process.env.RELEASE_VERSION
+
+            const emoji = conclusion === 'success' ? '✅' : '❌'
+            const message = `Installation test for ${platform} (${version}): ${emoji} ${conclusion}`
+
+            await github.rest.repos.createCommitComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: context.sha,
+              body: message
+            })
+        env:
+          GITHUB_JOB_STATUS: ${{ job.status }}
+          MATRIX_PLATFORM: ${{ matrix.platform }}
+          RELEASE_VERSION: ${{ fromJson(steps.get_release.outputs.result).tag_name }}
